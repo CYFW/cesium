@@ -6,6 +6,7 @@ define([
         '../Core/Cartesian3',
         '../Core/Cartesian4',
         '../Core/Cartographic',
+        '../Core/Check',
         '../Core/Color',
         '../Core/ColorGeometryInstanceAttribute',
         '../Core/createGuid',
@@ -34,6 +35,7 @@ define([
         '../Core/PerspectiveFrustum',
         '../Core/PerspectiveOffCenterFrustum',
         '../Core/PixelFormat',
+        '../Core/Ray',
         '../Core/RequestScheduler',
         '../Core/ShowGeometryInstanceAttribute',
         '../Core/TaskProcessor',
@@ -68,6 +70,7 @@ define([
         './PerformanceDisplay',
         './PerInstanceColorAppearance',
         './PickDepth',
+        './PickOffscreenFramebuffer',
         './PostProcessStageCollection',
         './Primitive',
         './PrimitiveCollection',
@@ -87,6 +90,7 @@ define([
         Cartesian3,
         Cartesian4,
         Cartographic,
+        Check,
         Color,
         ColorGeometryInstanceAttribute,
         createGuid,
@@ -115,6 +119,7 @@ define([
         PerspectiveFrustum,
         PerspectiveOffCenterFrustum,
         PixelFormat,
+        Ray,
         RequestScheduler,
         ShowGeometryInstanceAttribute,
         TaskProcessor,
@@ -149,6 +154,7 @@ define([
         PerformanceDisplay,
         PerInstanceColorAppearance,
         PickDepth,
+        PickOffscreenFramebuffer,
         PostProcessStageCollection,
         Primitive,
         PrimitiveCollection,
@@ -731,6 +737,15 @@ define([
         }
 
         this._cameraClone = Camera.clone(camera);
+
+        this._pickOffscreenFramebuffer = new PickOffscreenFramebuffer();
+        this._pickOffscreenCamera = new Camera(this);
+        this._pickOffscreenCamera.frustum = new OrthographicFrustum({
+            width: 0.1,
+            aspectRatio: 1.0,
+            near: 0.1,
+            far: 500000000.0
+        });
 
         // Keeps track of the state of a frame. FrameState is the state across
         // the primitives of the scene. This state is for internally keeping track
@@ -3760,6 +3775,8 @@ define([
      * @param {Cartesian3} [result] The object on which to restore the result.
      * @returns {Cartesian3} The cartesian position.
      *
+     * @see Scene#pickPositionFromRay
+     *
      * @exception {DeveloperError} Picking from the depth buffer is not supported. Check pickPositionSupported.
      */
     Scene.prototype.pickPosition = function(windowPosition, result) {
@@ -3773,6 +3790,87 @@ define([
             var cart = projection.unproject(result, scratchPickPositionCartographic);
             ellipsoid.cartographicToCartesian(cart, result);
         }
+
+        return result;
+    };
+
+    /**
+     * Returns the cartesian position in world coordinates that the ray collides with.
+     *
+     * @param {Ray} ray The ray to pick from.
+     * @param {Cartesian3} [result] The object on which to restore the result.
+     * @returns {Cartesian3} The cartesian position in world coordinates.
+     *
+     * @see Scene#pickPosition
+     *
+     * @exception {DeveloperError} Picking from the depth buffer is not supported. Check pickPositionSupported.
+     */
+    Scene.prototype.pickPositionFromRay = function(ray, result) {
+        //>>includeStart('debug', pragmas.debug);
+        Check.defined('ray', ray);
+        if (!this.pickPositionSupported) {
+            throw new DeveloperError('Picking from the depth buffer is not supported. Check pickPositionSupported.');
+        }
+        //>>includeEnd('debug');
+
+        var context = this._context;
+        var uniformState = context.uniformState;
+        var frameState = this._frameState;
+
+        var pickOffscreenCamera = this._pickOffscreenCamera;
+        pickOffscreenCamera.position = ray.origin;
+        pickOffscreenCamera.direction = ray.direction;
+
+        var pickOffscreenFramebuffer = this._pickOffscreenFramebuffer;
+
+        // Switch out the scene's camera with the offscreen camera
+        var sceneCamera = this._camera;
+        this._camera = pickOffscreenCamera;
+
+        this._jobScheduler.disableThisFrame();
+
+        // Update with previous frame's number and time, assuming that render is called before picking.
+        updateFrameState(this, frameState.frameNumber, frameState.time);
+        frameState.invertClassification = false;
+        frameState.passes.pick = true;
+        frameState.passes.offscreen = true;
+
+        uniformState.update(frameState);
+
+        var passState = pickOffscreenFramebuffer.begin(frameState);
+
+        updateEnvironment(this, passState);
+        updateAndExecuteCommands(this, passState, scratchColorZero);
+        resolveFramebuffers(this, passState);
+
+        var numFrustums = this.numberOfFrustums;
+        for (var i = 0; i < numFrustums; ++i) {
+            var pickDepth = getPickDepth(this, i);
+            var depth = pickDepth.getDepth(context, 0, 0);
+            if (depth > 0.0 && depth < 1.0) {
+                var renderedFrustum = this._frustumCommandsList[i];
+                var near = renderedFrustum.near * (i !== 0 ? this.opaqueFrustumNearOffset : 1.0);
+                var far = renderedFrustum.far;
+                var distance = near + depth * (far - near);
+                result = Ray.getPoint(ray, distance, result);
+                break;
+            }
+        }
+
+        if (this.mode !== SceneMode.SCENE3D) {
+            Cartesian3.fromElements(result.y, result.z, result.x, result);
+
+            var projection = this.mapProjection;
+            var ellipsoid = projection.ellipsoid;
+
+            var cartographic = projection.unproject(result, scratchPickPositionCartographic);
+            ellipsoid.cartographicToCartesian(cartographic, result);
+        }
+
+        this._camera = sceneCamera;
+
+        context.endFrame();
+        callAfterRenderFunctions(this);
 
         return result;
     };
